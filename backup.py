@@ -7,6 +7,7 @@ import os
 import shutil
 import sqlite3
 import json
+import sys  # <-- ДОБАВЛЕНО ДЛЯ РАБОТЫ НА ХОСТИНГЕ
 from datetime import datetime
 from pathlib import Path
 
@@ -213,7 +214,7 @@ def delete_backup(backup_name):
         return False
 
 def auto_backup():
-    """Создает автоматический бэкап"""
+    """Создает автоматический бэкап и удаляет старые"""
     ensure_backup_dir()
     
     # Удаляем старые бэкапы (старше 30 дней)
@@ -249,8 +250,25 @@ def show_menu():
     print("\n" + "="*50)
 
 def main():
-    """Главное меню"""
+    """Главное меню или автоматический запуск"""
     
+    # ПРОВЕРКА ДЛЯ ХОСТИНГА (работа без ввода/меню)
+    if len(sys.argv) > 1:
+        arg = sys.argv[1].lower()
+        
+        if arg == '1':
+            create_backup()
+        elif arg == 'auto':
+            # Идеально для хостинга: удаляет старые (старше 30 дней) и делает новый
+            auto_backup()
+        elif arg == '4':
+            export_data()
+        else:
+            print(f"❌ Неизвестный аргумент или команда не поддерживается в фоне: {arg}")
+            
+        return # Выходим из main, чтобы меню не запустилось
+    
+    # ИНТЕРАКТИВНОЕ МЕНЮ (для ручного запуска)
     while True:
         show_menu()
         choice = input("\nВыберите действие (0-5): ").strip()
