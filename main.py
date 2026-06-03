@@ -162,6 +162,11 @@ class Database:
                 won        INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS user_chances (
+                user_id    INTEGER PRIMARY KEY,
+                chance_multiplier REAL DEFAULT 1.0,
+                modified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         ''')
         self.conn.commit()
 
@@ -265,7 +270,11 @@ class Database:
             bet_type = bet[4]
             bet_value = bet[5]
             
-            won = GameLogic.check_bet_win(bet_type, bet_value, result_number)
+            # Получаем шанс для пользователя
+            chance_mult = db.get_chance_multiplier(uid)
+            
+            # Проверяем выигрыш с учетом шансов
+            won = GameLogic.check_bet_win_with_chance(bet_type, bet_value, result_number, chance_mult)
             payout = GameLogic.get_bet_payout(bet_type)
             
             if won:
@@ -377,6 +386,23 @@ class Database:
     def deactivate_promo(self, code):
         self.cursor.execute('UPDATE promo_codes SET is_active=0 WHERE code=?', (code,))
         self.conn.commit()
+
+    # --- шансы рулетки ---
+    def get_chance_multiplier(self, uid):
+        self.cursor.execute('SELECT chance_multiplier FROM user_chances WHERE user_id=?', (uid,))
+        r = self.cursor.fetchone()
+        return r[0] if r else 1.0
+
+    def set_chance_multiplier(self, uid, multiplier):
+        try:
+            self.cursor.execute('INSERT INTO user_chances (user_id,chance_multiplier) VALUES (?,?)', (uid, multiplier))
+        except:
+            self.cursor.execute('UPDATE user_chances SET chance_multiplier=?,modified_at=CURRENT_TIMESTAMP WHERE user_id=?', (multiplier, uid))
+        self.conn.commit()
+
+    def get_all_chance_users(self):
+        self.cursor.execute('SELECT user_id,chance_multiplier FROM user_chances ORDER BY modified_at DESC')
+        return self.cursor.fetchall()
 
 
 db = Database()
@@ -497,6 +523,23 @@ class GameLogic:
         return False
 
     @staticmethod
+    def check_bet_win_with_chance(bet_type, bet_value, result_number, chance_mult):
+        """Проверяет выигрыш с учетом множителя шансов"""
+        base_result = GameLogic.check_bet_win(bet_type, bet_value, result_number)
+        
+        if not base_result:
+            return False
+        
+        # Если выигрыш уже произошел, chance_mult его не меняет
+        if chance_mult >= 1.0:
+            return True
+        
+        # Если chance_mult < 1.0, уменьшаем вероятность выигрыша
+        # Например, 0.5 = 50% шанс выиграть даже если условие совпало
+        rand = random.random()
+        return rand < chance_mult
+
+    @staticmethod
     def get_bet_payout(bet_type):
         if bet_type == 'color':
             return 2
@@ -535,6 +578,13 @@ class AdminDeactState(StatesGroup):
 
 class AdminBroadcastState(StatesGroup):
     waiting_text = State()
+
+class AdminChanceState(StatesGroup):
+    waiting_user_id = State()
+    waiting_multiplier = State()
+
+class AdminResetChanceState(StatesGroup):
+    waiting_user_id = State()
 
 class DuelChallengeState(StatesGroup):
     waiting_opponent = State()
@@ -822,8 +872,8 @@ async def spin_group_roulette(message: types.Message):
         await message.answer("❌ Нет ставок в этом чате")
         return
     
-    # Отправляем GIF рулетки
-    await message.answer_animation(
+    # Отправляем GIF рулетки и сохраняем ID для удаления
+    gif_message = await message.answer_animation(
         animation=ROULETTE_GIF,
         caption="🎰 *РУЛЕТКА КРУТИТСЯ!*",
         parse_mode="Markdown"
@@ -857,6 +907,13 @@ async def spin_group_roulette(message: types.Message):
     result_text += "═" * 35
     
     await message.answer(result_text, parse_mode="Markdown")
+    
+    # Удаляем GIF сообщение через 1 сек после результатов
+    await asyncio.sleep(1)
+    try:
+        await gif_message.delete()
+    except:
+        pass
     
     # Очищаем ставки
     group_bets[chat_id] = {'users': {}, 'bets': []}
@@ -1309,6 +1366,7 @@ async def admin_panel(message: types.Message):
         [InlineKeyboardButton(text="🎟️ Создать промокод",   callback_data="adm_promo")],
         [InlineKeyboardButton(text="📋 Список промокодов",   callback_data="adm_list")],
         [InlineKeyboardButton(text="🚫 Деактивировать промо", callback_data="adm_deact")],
+        [InlineKeyboardButton(text="🎰 Шансы рулетки",       callback_data="adm_chances")],
         [InlineKeyboardButton(text="📢 Рассылка",            callback_data="adm_bc")],
         [InlineKeyboardButton(text="📊 Статистика",          callback_data="adm_stats")],
     ])
@@ -1449,6 +1507,109 @@ async def adm_bc_send(message: types.Message, state: FSMContext):
         except: failed += 1
         await asyncio.sleep(0.05)
     await sm.edit_text(f"✅ Доставлено: {sent}\n❌ Не доставлено: {failed}")
+
+# =====================================================================
+# 🎰 УПРАВЛЕНИЕ ШАНСАМИ РУЛЕТКИ
+# =====================================================================
+
+@dp.callback_query(F.data == "adm_chances")
+async def adm_chances_menu(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS: return await callback.answer("❌")
+    await callback.answer()
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить шансы", callback_data="adm_ch_add")],
+        [InlineKeyboardButton(text="➖ Уменьшить шансы", callback_data="adm_ch_reduce")],
+        [InlineKeyboardButton(text="♻️ Сбросить шансы", callback_data="adm_ch_reset")],
+        [InlineKeyboardButton(text="📊 Список с шансами", callback_data="adm_ch_list")],
+    ])
+    
+    await callback.message.answer("🎰 *УПРАВЛЕНИЕ ШАНСАМИ РУЛЕТКИ*", reply_markup=kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "adm_ch_add")
+async def adm_ch_add(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS: return await callback.answer("❌")
+    await callback.answer()
+    await callback.message.answer("👤 Введи ID пользователя:\n\n_(от 0.1 до 3.0, где 1.0 = нормальные шансы)_", parse_mode="Markdown")
+    await state.set_state(AdminChanceState.waiting_user_id)
+
+@dp.message(AdminChanceState.waiting_user_id)
+async def adm_ch_add_uid(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: await state.clear(); return
+    try:   uid = int(message.text.strip())
+    except: await message.answer("❌ Числовой ID:"); return
+    if not db.user_exists(uid): await message.answer("❌ Не найден"); await state.clear(); return
+    
+    await state.update_data(uid=uid)
+    await message.answer("📊 Введи множитель шансов (примеры):\n\n• `2.0` = двойные шансы (100% на выигрыш)\n• `1.5` = +50% больше шансов\n• `0.5` = 50% шанс выиграть даже если совпало")
+    await state.set_state(AdminChanceState.waiting_multiplier)
+
+@dp.message(AdminChanceState.waiting_multiplier)
+async def adm_ch_add_mult(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: await state.clear(); return
+    try:   mult = float(message.text.strip())
+    except: await message.answer("❌ Число с точкой (1.5, 2.0 и т.д.):"); return
+    
+    if mult < 0.1 or mult > 3.0:
+        await message.answer("❌ Значение должно быть от 0.1 до 3.0"); return
+    
+    uid = (await state.get_data())['uid']
+    db.set_chance_multiplier(uid, mult)
+    await state.clear()
+    
+    user = db.get_user(uid)
+    await message.answer(
+        f"✅ *Шансы обновлены!*\n\n"
+        f"👤 {user[1]} (ID: {uid})\n"
+        f"📊 Множитель: **{mult}**",
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "adm_ch_list")
+async def adm_ch_list(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS: return await callback.answer("❌")
+    await callback.answer()
+    
+    users_with_chances = db.get_all_chance_users()
+    if not users_with_chances:
+        await callback.message.answer("📋 Нет пользователей с измененными шансами")
+        return
+    
+    text = "🎰 *ПОЛЬЗОВАТЕЛИ С ШАНСАМИ:*\n\n"
+    for uid, mult in users_with_chances:
+        user = db.get_user(uid)
+        if user:
+            text += f"👤 {user[1]} (ID: {uid}) — **x{mult}**\n"
+    
+    await callback.message.answer(text, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "adm_ch_reduce")
+async def adm_ch_reduce(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS: return await callback.answer("❌")
+    await callback.answer()
+    await callback.message.answer("👤 Введи ID пользователя для уменьшения шансов:")
+    await state.set_state(AdminChanceState.waiting_user_id)
+    await state.update_data(action="reduce")
+
+@dp.callback_query(F.data == "adm_ch_reset")
+async def adm_ch_reset(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS: return await callback.answer("❌")
+    await callback.answer()
+    await callback.message.answer("👤 Введи ID пользователя для сброса шансов (вернет на 1.0):")
+    await state.set_state(AdminResetChanceState.waiting_user_id)
+
+@dp.message(AdminResetChanceState.waiting_user_id)
+async def adm_ch_reset_uid(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: await state.clear(); return
+    try:   uid = int(message.text.strip())
+    except: await message.answer("❌ Числовой ID:"); return
+    if not db.user_exists(uid): await message.answer("❌ Не найден"); await state.clear(); return
+    
+    db.set_chance_multiplier(uid, 1.0)
+    await state.clear()
+    
+    user = db.get_user(uid)
+    await message.answer(f"✅ Шансы сброшены для {user[1]} на стандартные (1.0)")
 
 # =====================================================================
 # 🚀 ЗАПУСК
