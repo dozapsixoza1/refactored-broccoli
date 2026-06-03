@@ -1,8 +1,8 @@
 """
-🎮 GRAM Bot v4.0
+🎮 GRAM Bot v4.1 — РУЛЕТКА
 - В чатах: б/баланс, топ, переводы, дуэли, мины, казна
-- В ЛС: всё + профиль, магазин, промокоды, админ-панель
-- Бонус в чате → ссылка на ЛС → автозабор по deep link
+- В ЛС: всё + профиль, магазин, промокоды, рулетка, админ-панель
+- Рулетка: ставки на номера (1-36), диапазоны (1-2, 4-5), цвета (ч/к/з)
 """
 
 import sqlite3
@@ -23,19 +23,19 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # =====================================================================
-# ⚙️ КОНФИГУРАЦИЯ  — измени под себя
+# ⚙️ КОНФИГУРАЦИЯ
 # =====================================================================
 
 BOT_TOKEN           = "8490098380:AAF087A6UMDeC6Dd_uZb7bAxT8VsGCcS8yI"
-BOT_USERNAME        = "gramvalybot"   # без @, нужен для deep-link бонуса
+BOT_USERNAME        = "gramvalybot"
 TELEGRAM_CHANNEL    = "https://t.me/gramvaly"
 TELEGRAM_CHANNEL_ID = "@gramvaly"
-ADMIN_IDS           = [8526401545]           # ← свой Telegram ID
+ADMIN_IDS           = [8526401545]
 
 STARTING_BALANCE     = 1000
 DAILY_BONUS_MIN      = 2500
 DAILY_BONUS_MAX      = 5000
-DAILY_BONUS_COOLDOWN = 86400  # 24 ч
+DAILY_BONUS_COOLDOWN = 86400
 
 SHOP_ITEMS = {
     '100k':  {'grams': 100_000,   'stars': 15},
@@ -45,6 +45,11 @@ SHOP_ITEMS = {
     '2.3m':  {'grams': 2_300_000, 'stars': 500},
     '6.25m': {'grams': 6_250_000, 'stars': 1000},
 }
+
+# Рулетка: четные = красные, нечетные = черные (кроме 0)
+RED_NUMBERS   = {2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36}
+BLACK_NUMBERS = {1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35}
+GREEN_NUMBER  = 0
 
 STAT_NAMES  = {'health':'Здоровье','strength':'Сила','endurance':'Выносливость',
                'block':'Блок','charisma':'Харизма','intuition':'Интуиция','speed':'Скорость'}
@@ -143,6 +148,16 @@ class Database:
                 used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(code, user_id)
             );
+            CREATE TABLE IF NOT EXISTS roulette_bets (
+                bet_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER,
+                amount     INTEGER,
+                bet_type   TEXT,
+                bet_value  TEXT,
+                result     TEXT DEFAULT 'pending',
+                won        INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         ''')
         self.conn.commit()
 
@@ -220,6 +235,27 @@ class Database:
                 (p1,p2,winner,reward))
             self.conn.commit()
         except Exception as e: logger.error(e)
+
+    # --- рулетка ---
+    def add_bet(self, uid, amount, bet_type, bet_value):
+        self.cursor.execute(
+            'INSERT INTO roulette_bets (user_id,amount,bet_type,bet_value) VALUES (?,?,?,?)',
+            (uid, amount, bet_type, bet_value))
+        self.conn.commit()
+        return self.cursor.lastrowid
+
+    def get_pending_bets(self, uid):
+        self.cursor.execute(
+            'SELECT * FROM roulette_bets WHERE user_id=? AND result="pending"', (uid,))
+        return self.cursor.fetchall()
+
+    def resolve_bet(self, bet_id, result_number, won, winnings):
+        color = 'зеленое' if result_number == 0 else ('красное' if result_number in RED_NUMBERS else 'черное')
+        self.cursor.execute(
+            'UPDATE roulette_bets SET result=?,won=? WHERE bet_id=?',
+            (f"{result_number}({color})", won, bet_id))
+        self.conn.commit()
+        return won
 
     # --- казна ---
     def get_treasury(self, chat_id):
@@ -365,6 +401,83 @@ class GameLogic:
     def random_bonus():
         return random.randint(DAILY_BONUS_MIN, DAILY_BONUS_MAX)
 
+    @staticmethod
+    def parse_roulette_bets(text):
+        """Парсит строку ставок вида: '333 1-2 2-3 4-5 ч' или '333 ч' или '333 15 17 22'"""
+        parts = text.strip().split()
+        if len(parts) < 2:
+            return None, "❌ Формат: `сумма вид1 вид2 ... видN`\nПримеры:\n• `333 ч` (на черное)\n• `333 к` (на красное)\n• `333 з` (на зеро)\n• `333 15` (на номер 15)\n• `333 1-2 4-5` (на диапазоны)"
+        
+        try:
+            amount = int(parts[0])
+        except:
+            return None, "❌ Первый аргумент должен быть число (сумма ставки)"
+        
+        if amount <= 0:
+            return None, "❌ Ставка должна быть > 0"
+        
+        bets = []
+        for part in parts[1:]:
+            # Цвет
+            if part.lower() in ['ч', 'черное', 'black']:
+                bets.append(('color', 'ч'))
+            elif part.lower() in ['к', 'красное', 'red']:
+                bets.append(('color', 'к'))
+            elif part.lower() in ['з', 'зеро', 'zero', '0']:
+                bets.append(('color', 'з'))
+            # Диапазон типа 1-2
+            elif '-' in part:
+                try:
+                    start, end = part.split('-')
+                    start, end = int(start), int(end)
+                    if not (1 <= start <= 36 and 1 <= end <= 36):
+                        return None, f"❌ Номера в диапазоне должны быть 1-36, получено {part}"
+                    bets.append(('range', f"{start}-{end}"))
+                except:
+                    return None, f"❌ Неверный диапазон: {part}"
+            # Отдельный номер
+            else:
+                try:
+                    num = int(part)
+                    if not (0 <= num <= 36):
+                        return None, f"❌ Номер должен быть 0-36, получено {num}"
+                    bets.append(('number', str(num)))
+                except:
+                    return None, f"❌ Неверный формат: {part}"
+        
+        if not bets:
+            return None, "❌ Не указаны виды ставок"
+        
+        return {'amount': amount, 'bets': bets}, None
+
+    @staticmethod
+    def check_bet_win(bet_type, bet_value, result_number):
+        """Проверяет, выигрывает ли ставка при выпадении номера"""
+        if bet_type == 'color':
+            if bet_value == 'ч':
+                return result_number in BLACK_NUMBERS
+            elif bet_value == 'к':
+                return result_number in RED_NUMBERS
+            elif bet_value == 'з':
+                return result_number == 0
+        elif bet_type == 'number':
+            return result_number == int(bet_value)
+        elif bet_type == 'range':
+            start, end = map(int, bet_value.split('-'))
+            return start <= result_number <= end
+        return False
+
+    @staticmethod
+    def get_bet_payout(bet_type):
+        """Возвращает коэффициент выплаты"""
+        if bet_type == 'color':
+            return 2  # Четные шансы
+        elif bet_type == 'number':
+            return 36  # На номер 1:36
+        elif bet_type == 'range':
+            return 3  # На диапазон 1:3
+        return 0
+
 
 # =====================================================================
 # 🤖 БОТ
@@ -373,7 +486,6 @@ class GameLogic:
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
 
-# Активные запросы дуэлей: {opponent_id: {challenger_id, name, amount}}
 duel_requests: dict = {}
 
 class PromoEnterState(StatesGroup):
@@ -397,6 +509,9 @@ class DuelChallengeState(StatesGroup):
     waiting_opponent = State()
     waiting_amount   = State()
 
+class RouletteBetState(StatesGroup):
+    waiting_bet = State()
+
 # =====================================================================
 # 🔧 УТИЛИТЫ
 # =====================================================================
@@ -413,14 +528,13 @@ def is_private(msg: types.Message) -> bool:
     return msg.chat.type == "private"
 
 def ensure_registered(uid, name):
-    """Создаёт пользователя если его нет"""
     if not db.user_exists(uid):
         db.create_user(uid, name)
 
 def main_keyboard(uid: int) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="👤 Профиль"),  KeyboardButton(text="💰 Баланс")],
-        [KeyboardButton(text="⚔️ Дуэль"),    KeyboardButton(text="🏰 Хогвартс")],
+        [KeyboardButton(text="⚔️ Дуэль"),    KeyboardButton(text="🎰 Рулетка")],
         [KeyboardButton(text="👥 Кланы"),    KeyboardButton(text="📊 Топ")],
         [KeyboardButton(text="🛒 Магазин"),  KeyboardButton(text="⌨️ Команды")],
         [KeyboardButton(text="🎟️ Промокод")],
@@ -430,7 +544,6 @@ def main_keyboard(uid: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 def bonus_status(uid):
-    """Возвращает (доступен:bool, таймер:str)"""
     last = db.get_last_bonus(uid)
     if not last: return True, ""
     lt = datetime.fromisoformat(last)
@@ -440,7 +553,7 @@ def bonus_status(uid):
     return False, f"{rem//3600}:{(rem%3600)//60:02d}:{rem%60:02d}"
 
 # =====================================================================
-# /start  — работает везде, меню только в ЛС
+# /start
 # =====================================================================
 
 @dp.message(Command("start"))
@@ -449,7 +562,6 @@ async def cmd_start(message: types.Message):
     name = message.from_user.username or message.from_user.first_name
     ensure_registered(uid, name)
 
-    # Deep-link автобонус: /start bonus
     args = message.text.split()
     if len(args) > 1 and args[1] == "bonus" and is_private(message):
         avail, timer = bonus_status(uid)
@@ -467,7 +579,7 @@ async def cmd_start(message: types.Message):
             )
         return
 
-    if not is_private(message): return  # в чатах /start без реакции
+    if not is_private(message): return
 
     if not await check_subscription(uid):
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -491,7 +603,7 @@ async def cb_check_sub(callback: types.CallbackQuery):
         await callback.answer("❌ Ты ещё не подписан!", show_alert=True)
 
 # =====================================================================
-# 💰 БАЛАНС — работает везде
+# 💰 БАЛАНС
 # =====================================================================
 
 @dp.message(F.text.in_({"💰 Баланс", "б", "баланс"}))
@@ -508,12 +620,10 @@ async def show_balance(message: types.Message):
     if avail:
         text += "✅ Ежедневный бонус доступен!"
         if is_private(message):
-            # В ЛС — inline кнопка прямо тут
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🎁 Получить бонус", callback_data="daily_bonus")]
             ])
         else:
-            # В чате — ссылка на ЛС с deep-link
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
                     text="🎁 Получить бонус в ЛС",
@@ -538,7 +648,7 @@ async def cb_daily_bonus(callback: types.CallbackQuery):
     await callback.message.answer(f"🎁 *Бонус получен!*\n\n+{amt:,} GRAM 🪙", parse_mode="Markdown")
 
 # =====================================================================
-# 📊 ТОП — работает везде
+# 📊 ТОП
 # =====================================================================
 
 @dp.message(F.text.in_({"📊 Топ", "/top", "/топ"}))
@@ -551,10 +661,9 @@ async def show_top(message: types.Message):
     await message.answer(text, parse_mode="Markdown")
 
 # =====================================================================
-# 💸 ПЕРЕВОДЫ — работают везде
+# 💸 ПЕРЕВОДЫ
 # =====================================================================
 
-# Реплай: п 500
 @dp.message(F.reply_to_message & F.text.regexp(r'^п\s+\d+$'))
 async def transfer_reply(message: types.Message):
     uid  = message.from_user.id
@@ -580,10 +689,9 @@ async def transfer_reply(message: types.Message):
         parse_mode="Markdown"
     )
 
-# По ID или @username: п @user 500  /  п 123456 500
 @dp.message(F.text.regexp(r'^п\s+\S+\s+\d+$'))
 async def transfer_id(message: types.Message):
-    if message.reply_to_message: return  # уже обработано выше
+    if message.reply_to_message: return
     uid  = message.from_user.id
     name = message.from_user.username or message.from_user.first_name
     ensure_registered(uid, name)
@@ -593,7 +701,6 @@ async def transfer_id(message: types.Message):
     try:    amount = int(parts[2])
     except: await message.answer("❌ Сумма должна быть числом"); return
 
-    # Ищем получателя
     rid = None; rname = identifier
     if identifier.startswith('@'):
         row = db.find_by_username(identifier[1:])
@@ -623,10 +730,139 @@ async def transfer_id(message: types.Message):
     await message.answer(f"✅ *Перевод выполнен*\n📤 {amount:,} 🪙 → {rname}", parse_mode="Markdown")
 
 # =====================================================================
+# 🎰 РУЛЕТКА
+# =====================================================================
+
+@dp.message(F.text == "🎰 Рулетка")
+async def roulette_menu(message: types.Message, state: FSMContext):
+    if not is_private(message): return
+    await message.answer(
+        "🎰 *РУЛЕТКА*\n\n"
+        "Введи ставку в формате:\n\n"
+        "`сумма вид1 вид2 ... видN`\n\n"
+        "*Примеры:*\n"
+        "• `333 ч` — на черное\n"
+        "• `333 к` — на красное\n"
+        "• `333 з` — на зеро (0)\n"
+        "• `333 15` — на номер 15\n"
+        "• `333 1-2 4-5` — на диапазоны 1-2 и 4-5\n"
+        "• `333 ч к з` — на все три цвета\n"
+        "• `333 15 17 22 ч` — на номера и цвет\n\n"
+        "_Ждём спина рулетки..._",
+        parse_mode="Markdown"
+    )
+    await state.set_state(RouletteBetState.waiting_bet)
+
+@dp.message(RouletteBetState.waiting_bet)
+async def roulette_bet(message: types.Message, state: FSMContext):
+    uid  = message.from_user.id
+    name = message.from_user.username or message.from_user.first_name
+    ensure_registered(uid, name)
+    
+    bet_data, error = GameLogic.parse_roulette_bets(message.text)
+    
+    if error:
+        await message.answer(error, parse_mode="Markdown")
+        return
+    
+    amount = bet_data['amount']
+    bets   = bet_data['bets']
+    
+    balance = db.get_balance(uid)
+    total_cost = amount * len(bets)
+    
+    if balance < total_cost:
+        await message.answer(f"❌ Недостаточно средств!\n💰 Нужно: {total_cost:,}, есть: {balance:,}")
+        await state.clear()
+        return
+    
+    # Списываем ставки
+    db.subtract_balance(uid, total_cost)
+    
+    # Сохраняем ставки в БД
+    bet_ids = []
+    for bet_type, bet_value in bets:
+        bet_id = db.add_bet(uid, amount, bet_type, bet_value)
+        bet_ids.append((bet_id, bet_type, bet_value))
+    
+    # Сообщение о принятых ставках
+    bets_text = ""
+    for bet_type, bet_value in bets:
+        if bet_type == 'color':
+            color_names = {'ч': 'черное', 'к': 'красное', 'з': 'зеро'}
+            bets_text += f"✅ Ставка принята: {amount:,} GRAM на *{color_names[bet_value]}*\n"
+        elif bet_type == 'number':
+            bets_text += f"✅ Ставка принята: {amount:,} GRAM на номер *{bet_value}*\n"
+        elif bet_type == 'range':
+            bets_text += f"✅ Ставка принята: {amount:,} GRAM на диапазон *{bet_value}*\n"
+    
+    await message.answer(bets_text, parse_mode="Markdown")
+    
+    # Анимация спина
+    anim = await message.answer("🎰 *СПИН РУЛЕТКИ!*\n\n🔴 ─ ─ ─ ─ ─", parse_mode="Markdown")
+    
+    for frame in ["🟢 ─ ─ ─ ─ ─", "─ 🔵 ─ ─ ─", "─ ─ 🟡 ─ ─", "─ ─ ─ 🟣 ─", "─ ─ ─ ─ 🟠"]:
+        await asyncio.sleep(0.3)
+        try:
+            await anim.edit_text(f"🎰 *СПИН РУЛЕТКИ!*\n\n{frame}", parse_mode="Markdown")
+        except:
+            pass
+    
+    # Результат
+    result_number = random.randint(0, 36)
+    color = '🟢 ЗЕРО' if result_number == 0 else ('🔴 КРАСНОЕ' if result_number in RED_NUMBERS else '⚫️ ЧЕРНОЕ')
+    
+    await asyncio.sleep(0.5)
+    
+    result_text = f"🎰 *РЕЗУЛЬТАТ: {result_number} {color}*\n\n"
+    
+    total_won = 0
+    
+    # Проверяем каждую ставку
+    for bet_id, bet_type, bet_value in bet_ids:
+        won = GameLogic.check_bet_win(bet_type, bet_value, result_number)
+        payout = GameLogic.get_bet_payout(bet_type)
+        
+        if won:
+            winnings = amount * payout
+            db.add_balance(uid, winnings)
+            total_won += winnings
+            
+            if bet_type == 'color':
+                color_names = {'ч': 'черное', 'к': 'красное', 'з': 'зеро'}
+                result_text += f"🎉 ✅ {color_names[bet_value]} — *выигрыш {winnings:,}*\n"
+            elif bet_type == 'number':
+                result_text += f"🎉 ✅ номер {bet_value} — *выигрыш {winnings:,}*\n"
+            elif bet_type == 'range':
+                result_text += f"🎉 ✅ диапазон {bet_value} — *выигрыш {winnings:,}*\n"
+        else:
+            if bet_type == 'color':
+                color_names = {'ч': 'черное', 'к': 'красное', 'з': 'зеро'}
+                result_text += f"❌ {color_names[bet_value]} — проигрыш\n"
+            elif bet_type == 'number':
+                result_text += f"❌ номер {bet_value} — проигрыш\n"
+            elif bet_type == 'range':
+                result_text += f"❌ диапазон {bet_value} — проигрыш\n"
+        
+        db.resolve_bet(bet_id, result_number, 1 if won else 0, amount * payout if won else 0)
+    
+    result_text += f"\n{'='*35}\n"
+    if total_won > 0:
+        result_text += f"🏆 *ОБЩИЙ ВЫИГРЫШ: {total_won:,} GRAM*"
+    else:
+        result_text += f"😔 Увы, ничего не выиграли"
+    
+    try:
+        await anim.edit_text(result_text, parse_mode="Markdown")
+    except:
+        await message.answer(result_text, parse_mode="Markdown")
+    
+    await state.clear()
+
+# =====================================================================
 # ⚔️ ДУЭЛЬ — в чате реплаем, в ЛС через меню
 # =====================================================================
 
-# --- В ЧАТЕ: реплай «дуэль» или «дуэль 500» ---
 @dp.message(F.reply_to_message & F.text.regexp(r'^дуэль(\s+\d+)?$'))
 async def duel_chat_reply(message: types.Message):
     parts  = message.text.strip().split()
@@ -656,7 +892,6 @@ async def duel_chat_reply(message: types.Message):
         reply_markup=kb, parse_mode="Markdown"
     )
 
-# --- В ЛС: через кнопку меню ---
 @dp.message(F.text == "⚔️ Дуэль")
 async def duel_menu(message: types.Message, state: FSMContext):
     if not is_private(message): return
@@ -715,7 +950,6 @@ async def duel_get_amt(message: types.Message, state: FSMContext):
         duel_requests.pop(oid, None)
         await message.answer("❌ Не удалось отправить запрос (соперник заблокировал бота)")
 
-# --- Принять / Отклонить дуэль ---
 @dp.callback_query(F.data.startswith("da_"))
 async def duel_accept(callback: types.CallbackQuery):
     oid  = callback.from_user.id
@@ -733,7 +967,6 @@ async def duel_accept(callback: types.CallbackQuery):
     if db.get_balance(oid) < amount:
         await callback.message.answer(f"❌ У вас нет {amount:,} GRAM для этой ставки"); return
 
-    # Анимация
     anim = await callback.message.answer("⚔️ *БОЙ!*\n\n⚔️ · · ·", parse_mode="Markdown")
     for f in ["· ⚔️ · ·","· · ⚔️ ·","· · · ⚔️","⚔️ · · ·"]:
         await asyncio.sleep(0.4)
@@ -775,7 +1008,7 @@ async def duel_decline(callback: types.CallbackQuery):
     except: pass
 
 # =====================================================================
-# 💣 МИНЫ — работают везде
+# 💣 МИНЫ
 # =====================================================================
 
 @dp.message(F.text.regexp(r'^мины\s+\d+$'))
@@ -878,7 +1111,7 @@ async def ms_click(callback: types.CallbackQuery):
         )
 
 # =====================================================================
-# 🏦 КАЗНА — работает в чатах
+# 🏦 КАЗНА
 # =====================================================================
 
 @dp.message(F.text.regexp(r'^казна(\s+\d+)?$'))
@@ -895,7 +1128,6 @@ async def treasury_cmd(message: types.Message):
     t = db.get_treasury(chat_id)
 
     if not t:
-        # Создаём казну бесплатно
         db.create_treasury(chat_id, uid)
         await message.answer(
             "🏦 *Казна создана!*\n\n"
@@ -907,7 +1139,6 @@ async def treasury_cmd(message: types.Message):
         return
 
     if len(parts) > 1:
-        # Пополнение казны
         amt = int(parts[1])
         if db.get_balance(uid) < amt:
             await message.answer(f"❌ Недостаточно: {db.get_balance(uid):,}"); return
@@ -916,7 +1147,6 @@ async def treasury_cmd(message: types.Message):
         t = db.get_treasury(chat_id)
         await message.answer(f"✅ Казна пополнена на {amt:,} GRAM\n💰 Баланс казны: {t[2]:,}", parse_mode="Markdown")
     else:
-        # Показать состояние
         await message.answer(
             f"🏦 *КАЗНА ЧАТА*\n\n"
             f"💰 Баланс: {t[2]:,} GRAM\n"
@@ -959,7 +1189,7 @@ async def new_member(message: types.Message):
             )
 
 # =====================================================================
-# 👤 ПРОФИЛЬ — только ЛС
+# 👤 ПРОФИЛЬ
 # =====================================================================
 
 @dp.message(F.text.in_({"👤 Профиль", "/профиль"}))
@@ -975,7 +1205,7 @@ async def show_profile(message: types.Message):
     await message.answer(text, parse_mode="Markdown")
 
 # =====================================================================
-# 🛒 МАГАЗИН — только ЛС (реальные Telegram Stars)
+# 🛒 МАГАЗИН
 # =====================================================================
 
 @dp.message(F.text == "🛒 Магазин")
@@ -1023,7 +1253,7 @@ async def successful_payment(message: types.Message):
         )
 
 # =====================================================================
-# 🎟️ ПРОМОКОДЫ — только ЛС
+# 🎟️ ПРОМОКОДЫ
 # =====================================================================
 
 @dp.message(F.text == "🎟️ Промокод")
@@ -1052,6 +1282,7 @@ async def show_commands(message: types.Message):
         "💸 `п @user сумма` — перевод по username\n"
         "⚔️ `дуэль` или `дуэль сумма` — вызов реплаем\n"
         "💣 `мины сумма` — минное поле\n"
+        "🎰 `рулетка` — ставки на рулетку\n"
         "🏦 `казна` — казна чата\n"
         "📊 `топ` или `/топ` — рейтинг\n"
         "🎟️ Промокод — ввести промокод (ЛС)\n",
@@ -1064,7 +1295,7 @@ async def stubs(message: types.Message):
     await message.answer("🔧 В разработке...")
 
 # =====================================================================
-# 🔐 АДМИН-ПАНЕЛЬ — только ЛС
+# 🔐 АДМИН-ПАНЕЛЬ
 # =====================================================================
 
 @dp.message(F.text == "🔐 Админ-панель")
@@ -1222,7 +1453,7 @@ async def adm_bc_send(message: types.Message, state: FSMContext):
 # =====================================================================
 
 async def main():
-    logger.info("✅ Бот запущен")
+    logger.info("✅ Бот запущен (v4.1 с рулеткой)")
     if ADMIN_IDS == [123456789]:
         logger.warning("⚠️  Замени ADMIN_IDS на свой реальный Telegram ID!")
     if BOT_USERNAME == "your_bot_username":
